@@ -1,0 +1,58 @@
+# Scry stack: the scanner + a local Ollama for rating.
+#
+#   1. docker compose up -d ollama
+#   2. docker compose run --rm ollama-pull        # one-time: pull the model
+#   3. docker compose run --rm scry <target> [flags]
+#
+# The scanner shares the host network so it can reach CTF targets on your
+# VPN/LAN the same way nmap on the host would. Remove network_mode if you
+# only scan public IPs and prefer isolation.
+
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: scry-ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # Uncomment to use an NVIDIA GPU:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+  # One-shot helper to pull the rating model into the ollama volume.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on: [ollama]
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["ollama", "pull", "${OLLAMA_MODEL:-llama3.1}"]
+    restart: "no"
+
+  scry:
+    build: .
+    image: scry:latest
+    depends_on: [ollama]
+    environment:
+      # With network_mode: host the container can't use compose DNS, so reach
+      # Ollama through its published port on localhost. If you drop host
+      # networking, change this back to http://ollama:11434.
+      - OLLAMA_HOST=http://localhost:11434
+      - OLLAMA_MODEL=${OLLAMA_MODEL:-llama3.1}
+    volumes:
+      - ./reports:/app/reports
+    # host networking lets nmap reach targets on your VPN/LAN.
+    network_mode: host
+    # SYN scans + OS detection need raw sockets:
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+
+volumes:
+  ollama-models:

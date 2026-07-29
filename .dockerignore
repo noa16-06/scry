@@ -1,0 +1,9 @@
+reports/
+__pycache__/
+*.pyc
+.git/
+.venv/
+venv/
+.env
+*.md
+!README.md

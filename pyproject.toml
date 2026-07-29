@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scry"
+version = "0.1.0"
+description = "Automated CTF reconnaissance and LLM-based vulnerability rating"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["requests>=2.31,<3"]
+
+[project.scripts]
+scry = "scry.cli:main"
+
+[tool.setuptools]
+packages = ["scry"]
