@@ -1,8 +1,11 @@
-"""Rate findings with a local Ollama model.
+"""Rate findings in one of two modes.
 
-Each finding is rated individually — small local models produce far more
-reliable JSON for one item than for a big batch. If Ollama is unreachable the
-rater falls back to a simple heuristic so a scan still yields output.
+- "ollama": a local Ollama model rates each finding individually — small local
+  models produce far more reliable JSON for one item than for a big batch.
+- "raster": a deterministic scoring grid rates findings with no AI at all.
+
+In "ollama" mode, if Ollama is unreachable the rater falls back to the raster
+grid so a scan still yields output.
 """
 from __future__ import annotations
 
@@ -42,17 +45,21 @@ class Rater:
         host: str = DEFAULT_HOST,
         model: str = DEFAULT_MODEL,
         timeout: int = 120,
-        enabled: bool = True,
+        mode: str = "ollama",
     ):
         self.host = host.rstrip("/")
         self.model = model
         self.timeout = timeout
-        self.enabled = enabled
+        self.mode = mode  # "ollama" (LLM) | "raster" (deterministic grid)
         self._session = requests.Session()
+
+    @property
+    def uses_llm(self) -> bool:
+        return self.mode == "ollama"
 
     # ------------------------------------------------------------------ #
     def available(self) -> bool:
-        if not self.enabled:
+        if not self.uses_llm:
             return False
         try:
             r = self._session.get(f"{self.host}/api/tags", timeout=5)
@@ -73,13 +80,12 @@ class Rater:
 
     # ------------------------------------------------------------------ #
     def rate(self, finding: Finding) -> Rating:
-        if not self.enabled:
-            return _heuristic_rating(finding, note="rating disabled")
+        if not self.uses_llm:
+            return _raster_rating(finding)
         try:
             return self._rate_via_ollama(finding)
         except (requests.RequestException, ValueError, KeyError) as exc:
-            r = _heuristic_rating(finding, note=f"ollama error: {exc}")
-            return r
+            return _raster_rating(finding, note=f"ollama unavailable, used raster grid ({exc})")
 
     def rate_all(self, findings: list[Finding], progress: bool = True) -> None:
         total = len(findings)
@@ -169,33 +175,82 @@ def _rating_from_json(data: dict) -> Rating:
     )
 
 
-def _heuristic_rating(finding: Finding, note: str = "") -> Rating:
-    """Best-effort rating without an LLM, based on finding kind, CVEs, exploits."""
-    if finding.kind == "nse-vuln":
-        sev, score = "high", 7.0
-    elif finding.kind == "cve":
-        sev, score = "high", 6.5
-    else:
-        sev, score = "info", 2.5
+def _raster_rating(finding: Finding, note: str = "") -> Rating:
+    """Deterministic "raster" rating: score a finding on a fixed grid, no LLM.
 
-    # A public exploit — especially a CVE-matched one — bumps the rating.
+    The score is built from transparent, additive components so the rating is
+    fully explainable and reproducible:
+        base(kind) + exploit bonus + cve bonus + service-risk bonus, clamped 0-10.
+    """
+    # 1. Base score by finding kind.
+    base = {"nse-vuln": 6.0, "cve": 5.5}.get(finding.kind, 2.0)
+    score = base
+    reasons = [f"base {base:.1f} ({finding.kind})"]
+
+    # 2. Public exploit availability — the strongest signal.
     cve_exploits = [e for e in finding.exploits if e.match == "cve"]
     if cve_exploits:
-        sev, score = "critical", max(score, 9.0)
+        score += 3.5
+        reasons.append(f"+3.5 CVE-matched exploit x{len(cve_exploits)}")
     elif finding.exploits:
-        # term-only matches are weaker signals; nudge but stay cautious
-        if sev in ("info", "low"):
-            sev, score = "medium", max(score, 5.0)
+        # Term/version matches are weaker: they are hints, not confirmed hits.
+        score += 1.5
+        reasons.append(f"+1.5 term-matched exploit x{len(finding.exploits)}")
+
+    # 3. Each known CVE id adds a little, capped so it can't dominate.
+    if finding.cves:
+        bonus = min(1.5, 0.3 * len(finding.cves))
+        score += bonus
+        reasons.append(f"+{bonus:.1f} {len(finding.cves)} CVE(s)")
+
+    # 4. Historically risky services deserve a nudge.
+    risky = {
+        "ftp", "telnet", "smb", "microsoft-ds", "netbios-ssn", "rdp",
+        "ms-wbt-server", "mysql", "mssql", "vnc", "rlogin", "rexec",
+    }
+    if finding.service and finding.service.name in risky:
+        score += 1.0
+        reasons.append(f"+1.0 risky service ({finding.service.name})")
+
+    score = max(0.0, min(10.0, score))
+    sev = _severity_for_score(score)
+
+    reasoning = "raster grid: " + " ".join(reasons) + f" = {score:.1f}"
+    if note:
+        reasoning = f"{note}. {reasoning}"
 
     return Rating(
         severity=sev,
         score=score,
-        exploitability="unknown (LLM unavailable)",
-        ctf_relevance="review manually",
-        reasoning=note or "heuristic rating (Ollama not used)",
+        exploitability=_exploitability_phrase(finding),
+        ctf_relevance="verify manually — scored by fixed grid, not AI",
+        reasoning=reasoning,
         next_steps=_default_steps(finding),
-        source="heuristic",
+        source="raster",
     )
+
+
+def _severity_for_score(score: float) -> str:
+    """Map a 0-10 raster score onto a severity band."""
+    if score >= 9.0:
+        return "critical"
+    if score >= 7.0:
+        return "high"
+    if score >= 4.0:
+        return "medium"
+    if score >= 2.0:
+        return "low"
+    return "info"
+
+
+def _exploitability_phrase(finding: Finding) -> str:
+    if any(e.match == "cve" for e in finding.exploits):
+        return "public CVE-matched exploit available"
+    if finding.exploits:
+        return "possible public exploit (term match — verify)"
+    if finding.cves:
+        return "CVE known; no public exploit indexed"
+    return "unknown"
 
 
 def _default_steps(finding: Finding) -> list[str]:

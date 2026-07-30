@@ -1,8 +1,14 @@
 # Scry
 
 Automated **recon for CTFs**: scan ports, surface likely vulnerabilities, and
-have a **local LLM (Ollama)** rate each finding by severity, exploitability, and
-how useful it is for grabbing a flag — then hand you concrete next steps.
+rate each finding by severity, exploitability, and how useful it is for grabbing
+a flag — then hand you concrete next steps.
+
+Two rating modes, picked with `--mode`:
+
+- **`ollama`** (default) — a **local LLM** judges each finding and explains itself.
+- **`raster`** — a **deterministic scoring grid**, no AI: same input, same score,
+  every time. Also the automatic fallback when Ollama is unreachable.
 
 Runs as a single command or as a self-contained Docker stack (scanner + Ollama).
 
@@ -31,9 +37,9 @@ Runs as a single command or as a self-contained Docker stack (scanner + Ollama).
 
 ```
  target ─▶ scanner.py ─▶ vuln.py ─▶ enrich.py ─▶ rater.py ─▶ report.py
-           (nmap -sV     (findings:  (searchsploit  (Ollama     (terminal +
-            + NSE vuln)   NSE/CVE/     Exploit-DB     rates each  JSON + Markdown)
-                          services)    lookups)       finding)
+           (nmap -sV     (findings:  (searchsploit  (ollama LLM  (terminal +
+            + NSE vuln)   NSE/CVE/     Exploit-DB     or raster   JSON + Markdown)
+                          services)    lookups)       grid)
 ```
 
 1. **Scan** — wraps `nmap` for port discovery + service/version detection, with
@@ -43,11 +49,17 @@ Runs as a single command or as a self-contained Docker stack (scanner + Ollama).
 3. **Enrich (exploits)** — `searchsploit` looks up public Exploit-DB entries for
    each finding: by **CVE id** (high confidence) and by **product/version** term
    (a hint). Matches (EDB-ID, title, local path, CVE codes) are attached.
-4. **Rate** — each finding is sent to a local Ollama model, which returns
-   structured JSON (severity, 0–10 score, exploitability, CTF relevance,
-   reasoning, next steps). Known public exploits are fed into the prompt and
-   weighed heavily. If Ollama is down, a heuristic rating is used instead — and
-   it too escalates findings that have a CVE-matched exploit.
+4. **Rate** — two modes, chosen with `--mode`:
+   - **`ollama`** (default) — each finding is sent to a local Ollama model, which
+     returns structured JSON (severity, 0–10 score, exploitability, CTF
+     relevance, reasoning, next steps). Known public exploits are fed into the
+     prompt and weighed heavily. If Ollama is down, Scry falls back to the raster
+     grid so a scan still yields output.
+   - **`raster`** (`--mode raster`, or the `--no-rate` alias) — a deterministic
+     scoring **grid** rates every finding with no AI at all:
+     `base(kind) + exploit bonus + CVE bonus + service-risk bonus`, clamped 0–10
+     and mapped to a severity band. Fully reproducible and offline; each rating's
+     `reasoning` shows the exact component breakdown.
 5. **Report** — prints a prioritized summary and writes `reports/<target>.json`
    and `reports/<target>.md`.
 
@@ -127,9 +139,10 @@ scry <target> [options]
 | `--no-searchsploit` | Disable Exploit-DB (searchsploit) lookups |
 | `--no-service-exploits` | Look up exploits by CVE only; skip product/version term searches |
 | `--searchsploit-bin PATH` | Path to the `searchsploit` executable |
-| `--model NAME` | Ollama model to rate with |
+| `--mode {ollama,raster}` | Rating mode: `ollama`=local LLM (default), `raster`=deterministic scoring grid, no AI |
+| `--model NAME` | Ollama model to rate with (ollama mode) |
 | `--ollama-host URL` | Ollama base URL (default `http://localhost:11434`) |
-| `--no-rate` | Skip the LLM; heuristic ratings only |
+| `--no-rate` | Deprecated alias for `--mode raster` |
 | `-o, --output DIR` | Report directory (default `reports/`) |
 | `--format {json,md,all,none}` | Which report files to write |
 | `-q / -v` | Quiet / verbose |
@@ -137,8 +150,8 @@ scry <target> [options]
 ### Examples
 
 ```bash
-# Fast triage, no LLM
-scry 10.10.10.5 --profile fast --no-rate
+# Fast triage, no LLM — deterministic raster grid only
+scry 10.10.10.5 --profile fast --mode raster
 
 # Full vuln sweep rated by a specific model
 scry 10.10.10.5 --profile thorough --vuln-scripts --model qwen2.5:7b
@@ -159,7 +172,7 @@ scry 10.10.10.5 --format json -q
 Each finding is looked up in **Exploit-DB** via `searchsploit -j`:
 
 - **By CVE** (`searchsploit --cve CVE-…`) — high confidence; a CVE-matched public
-  exploit escalates the finding (heuristic mode rates it *critical*).
+  exploit escalates the finding (in raster mode it adds the largest bonus, +3.5).
 - **By product + version** (e.g. `vsftpd 2.3.4`) — a weaker hint; verify the
   version yourself. Disable with `--no-service-exploits`.
 
@@ -177,6 +190,35 @@ update the DB.
 > **Tip:** `-sS` (SYN) scans and `--os` need raw-socket privileges. The tool
 > auto-uses a TCP connect scan (`-sT`) when not root, so it still works
 > unprivileged — just a bit slower and noisier.
+
+### Rating modes
+
+**`--mode ollama`** (default) sends each finding to your local Ollama instance
+one at a time — small models produce far more reliable JSON for a single item
+than for a batch — and asks for severity, a 0–10 score, exploitability, CTF
+relevance, reasoning, and next steps. Attached Exploit-DB matches go into the
+prompt and are weighed heavily. If Ollama is unreachable, or the model isn't
+pulled, or a response fails validation, Scry falls back to the raster grid.
+
+**`--mode raster`** skips the LLM entirely and scores on a fixed additive grid:
+
+| Component | Value |
+|-----------|-------|
+| Base — NSE vuln hit | 6.0 |
+| Base — CVE finding | 5.5 |
+| Base — notable service | 2.0 |
+| CVE-matched public exploit | +3.5 |
+| Term/version-matched exploit | +1.5 |
+| Known CVE ids | +0.3 each, capped at +1.5 |
+| Historically risky service (ftp, telnet, smb, rdp, vnc, …) | +1.0 |
+
+The total is clamped to 0–10 and mapped to a band: **critical** ≥ 9,
+**high** ≥ 7, **medium** ≥ 4, **low** ≥ 2, otherwise **info**. Every rating's
+`reasoning` spells out the components that produced its score, e.g.
+`raster grid: base 5.5 (cve) +3.5 CVE-matched exploit x2 +0.6 2 CVE(s) = 9.6`.
+
+Use raster when you want speed, reproducible output for diffing, or a fully
+offline run with no model pulled.
 
 ---
 
@@ -199,7 +241,7 @@ Scry/
 │   ├── scanner.py    # nmap invocation + XML parsing
 │   ├── vuln.py       # build findings from scan results
 │   ├── enrich.py     # searchsploit / Exploit-DB lookups
-│   ├── rater.py      # Ollama client + heuristic fallback
+│   ├── rater.py      # Ollama client + raster scoring grid
 │   ├── report.py     # terminal / JSON / Markdown output
 │   └── models.py     # dataclasses
 ├── Dockerfile
@@ -210,12 +252,14 @@ Scry/
 
 ## Notes & limitations
 
-- Ratings are LLM opinions to **triage and prioritize**, not ground truth —
-  always verify before firing exploits.
+- Ratings — LLM opinion or raster score — exist to **triage and prioritize**, not
+  to be ground truth. Always verify before firing exploits.
 - nmap ships the `vuln` NSE category; `vulners` is third-party — install it into
   nmap's scripts dir if you want version→CVE mapping via `--nmap-scripts vulners`.
 - searchsploit **term** matches (product/version) can have false positives —
   they're hints to verify, not confirmed exploits. CVE-matched entries are
   reliable. Keep the DB fresh with `searchsploit -u`.
 - Small local models occasionally return imperfect JSON; the rater validates and
-  falls back to a heuristic rating per-finding rather than failing the run.
+  falls back to the raster grid per-finding rather than failing the run. Each
+  rating records which mode produced it in its `source` field (`ollama` /
+  `raster`).

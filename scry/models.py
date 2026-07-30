@@ -66,7 +66,7 @@ class Exploit:
 
 @dataclass
 class Rating:
-    """LLM (or heuristic) assessment of a finding."""
+    """LLM (ollama) or deterministic (raster) assessment of a finding."""
 
     severity: str = "unknown"
     score: float = 0.0            # 0-10 CVSS-like
@@ -74,7 +74,7 @@ class Rating:
     ctf_relevance: str = ""       # why it matters for a CTF flag
     reasoning: str = ""
     next_steps: list[str] = field(default_factory=list)
-    source: str = "ollama"        # ollama | heuristic | error
+    source: str = "ollama"        # ollama | raster
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

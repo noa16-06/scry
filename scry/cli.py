@@ -12,16 +12,34 @@ from .scanner import ScanError, scan
 from .vuln import build_findings
 
 BANNER = r"""
- ____    ____   ____  __   __
-/ ___|  / ___||  _ \ \ \ / /
-\___ \ | |    | |_) | \ V /
- ___) || |___ |  _ <   | |
-|____/  \____||_| \_\  |_|    CTF recon + LLM rating
+                                                                
+            _____          _____  ___________   ______   _____  
+       _____\    \    _____\    \_\          \ |\     \ |     | 
+      /    / \    |  /     /|     |\    /\    \\ \     \|     | 
+     |    |  /___/| /     / /____/| |   \_\    |\ \           | 
+  ____\    \ |   |||     | |____|/  |      ___/  \ \____      | 
+ /    /\    \|___|/|     |  _____   |      \  ____\|___/     /| 
+|    |/ \    \     |\     \|\    \ /     /\ \/    \   /     / | 
+|\____\ /____/|    | \_____\|    |/_____/ |\______|  /_____/  / 
+| |   ||    | |    | |     /____/||     | | |     |  |     | /  
+ \|___||____|/      \|_____|    |||_____|/ \|_____|  |_____|/   
+                           |____|/                              
 """
 
 
+class _BannerParser(argparse.ArgumentParser):
+    """argparse parser that shows the banner on --help and on usage errors."""
+
+    def format_help(self) -> str:
+        return f"{BANNER}\n{super().format_help()}"
+
+    def error(self, message: str):
+        print(BANNER, file=sys.stderr)
+        super().error(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    p = _BannerParser(
         prog="scry",
         description="Automate CTF recon: scan ports, find vulns, rate them with a local LLM.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -51,11 +69,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     enrich_g.add_argument("--searchsploit-bin", default="searchsploit", help="searchsploit executable to use.")
 
-    rate_g = p.add_argument_group("rating (Ollama)")
-    rate_g.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name.")
-    rate_g.add_argument("--ollama-host", default=DEFAULT_HOST, help="Ollama base URL.")
-    rate_g.add_argument("--no-rate", action="store_true", help="Skip LLM rating (use heuristics only).")
-    rate_g.add_argument("--rate-timeout", type=int, default=120, help="Per-finding LLM timeout (s).")
+    rate_g = p.add_argument_group("rating")
+    rate_g.add_argument(
+        "--mode", choices=["ollama", "raster"], default="ollama",
+        help="Rating mode: 'ollama' = rate with a local LLM; "
+             "'raster' = deterministic scoring grid, no AI.",
+    )
+    rate_g.add_argument("--model", default=DEFAULT_MODEL, help="Ollama model name (ollama mode).")
+    rate_g.add_argument("--ollama-host", default=DEFAULT_HOST, help="Ollama base URL (ollama mode).")
+    rate_g.add_argument("--no-rate", action="store_true", help="Deprecated alias for --mode raster.")
+    rate_g.add_argument("--rate-timeout", type=int, default=120, help="Per-finding LLM timeout in seconds (ollama mode).")
 
     out_g = p.add_argument_group("output")
     out_g.add_argument("-o", "--output", default="reports", help="Directory for report files.")
@@ -112,19 +135,23 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"[*] {n_expl} exploit match(es) from Exploit-DB.", file=sys.stderr, flush=True)
 
     # 4. Rate
+    mode = "raster" if args.no_rate else args.mode
     rater = Rater(
         host=args.ollama_host,
         model=args.model,
         timeout=args.rate_timeout,
-        enabled=not args.no_rate,
+        mode=mode,
     )
-    if not args.no_rate and findings:
+    if mode == "ollama" and findings:
         if not rater.available():
-            print(f"[!] Ollama not reachable at {args.ollama_host}; falling back to heuristics.", file=sys.stderr)
+            print(f"[!] Ollama not reachable at {args.ollama_host}; using the raster grid instead.", file=sys.stderr)
+            rater.mode = "raster"
         elif not rater.ensure_model():
             print(f"[!] Model '{args.model}' not found in Ollama. Run: ollama pull {args.model}", file=sys.stderr)
-            print("[!] Falling back to heuristic ratings.", file=sys.stderr)
-            rater.enabled = False
+            print("[!] Using the raster grid instead.", file=sys.stderr)
+            rater.mode = "raster"
+    if not args.quiet:
+        print(f"[*] Rating mode: {rater.mode}", file=sys.stderr, flush=True)
     rater.rate_all(findings, progress=not args.quiet)
 
     # 5. Report
