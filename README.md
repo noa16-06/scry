@@ -1,5 +1,7 @@
 # Scry
 
+[![CI](https://github.com/noa16-06/scry/actions/workflows/ci.yml/badge.svg)](https://github.com/noa16-06/scry/actions/workflows/ci.yml)
+
 Automated **recon for CTFs**: scan ports, surface likely vulnerabilities, and
 rate each finding by severity, exploitability, and how useful it is for grabbing
 a flag — then hand you concrete next steps.
